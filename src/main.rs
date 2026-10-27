@@ -9,8 +9,9 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title(concat!("OPSearch Companion ", env!("CARGO_PKG_VERSION")))
-            .with_inner_size([760.0, 680.0])
-            .with_min_inner_size([640.0, 480.0])
+            .with_inner_size(ui::WINDOW_SIZE)
+            .with_resizable(false)
+            .with_decorations(false)
             .with_icon(ui::window_icon()),
         ..Default::default()
     };

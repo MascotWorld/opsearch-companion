@@ -1,6 +1,7 @@
 use chrono::{Local, TimeZone};
 use eframe::egui::{
-    self, Align, Color32, FontFamily, FontId, Layout, RichText, Sense, Stroke, Vec2,
+    self, Align, Align2, Color32, CornerRadius, CursorIcon, FontFamily, FontId, Layout, Pos2, Rect,
+    RichText, Sense, Stroke, StrokeKind, Vec2,
 };
 use opsearch_companion::{
     CURRENT_VERSION, Command, CoreHandle, DEFAULT_SERVER, Event, Player, Roster, Status,
@@ -9,21 +10,25 @@ use opsearch_companion::{
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-// The opsearch.pro palette, flattened to opaque colours: a near-black page, glassy grey panels,
-// a light primary button and a mint accent.
+/// The window is fixed: everything fits without scrolling.
+pub const WINDOW_SIZE: [f32; 2] = [400.0, 600.0];
+const TITLE_BAR: f32 = 46.0;
+const PAD: f32 = 22.0;
+const MAX_ROWS: usize = 10;
+const ROW: f32 = 30.0;
+
+// The opsearch.pro palette, flattened to opaque colours.
 const BG: Color32 = Color32::from_rgb(11, 13, 17);
+const BG_TOP: Color32 = Color32::from_rgb(20, 22, 27);
 const SURFACE: Color32 = Color32::from_rgb(23, 26, 32);
-const SURFACE_RAISED: Color32 = Color32::from_rgb(32, 35, 42);
-const SURFACE_HOVER: Color32 = Color32::from_rgb(41, 44, 52);
-const BORDER: Color32 = Color32::from_rgb(42, 45, 52);
+const SURFACE_HOVER: Color32 = Color32::from_rgb(33, 36, 43);
+const BORDER: Color32 = Color32::from_rgb(38, 41, 48);
 const TEXT: Color32 = Color32::from_rgb(238, 241, 245);
-const MUTED: Color32 = Color32::from_rgb(161, 169, 181);
-const DIM: Color32 = Color32::from_rgb(147, 155, 168);
+const MUTED: Color32 = Color32::from_rgb(143, 151, 163);
+const FAINT: Color32 = Color32::from_rgb(98, 105, 116);
 const PRIMARY: Color32 = Color32::from_rgb(244, 246, 248);
 const ON_PRIMARY: Color32 = Color32::from_rgb(11, 13, 17);
-const ACCENT: Color32 = Color32::from_rgb(201, 245, 215);
-const LINK: Color32 = ACCENT;
-const GREEN: Color32 = ACCENT;
+const MINT: Color32 = Color32::from_rgb(201, 245, 215);
 const AMBER: Color32 = Color32::from_rgb(243, 201, 139);
 const RED: Color32 = Color32::from_rgb(241, 166, 166);
 
@@ -33,27 +38,29 @@ pub struct CompanionApp {
     status: Status,
     owner_id: Option<String>,
     roster: Option<Roster>,
-    code: String,
-    busy: bool,
+    link_url: Option<String>,
     error: Option<String>,
-    notice: Option<String>,
-    help_open: bool,
-    last_event: Option<String>,
-    startup_error: Option<String>,
     updates: Option<UpdateChecker>,
     update: Option<UpdateInfo>,
+}
+
+/// What the middle of the window says, derived from the worker's status.
+struct Headline {
+    color: Color32,
+    pulse: bool,
+    title: &'static str,
+    detail: String,
 }
 
 impl CompanionApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         apply_theme(&cc.egui_ctx);
-        let app_icon = window_icon();
         let logo = cc.egui_ctx.load_texture(
             "opsearch-icon-v1",
-            egui::ColorImage::from(app_icon.as_ref()),
+            egui::ColorImage::from(window_icon().as_ref()),
             egui::TextureOptions::LINEAR,
         );
-        let (core, startup_error) = match CoreHandle::new() {
+        let (core, error) = match CoreHandle::new() {
             Ok(core) => {
                 let _ = core.send(Command::Start);
                 (Some(core), None)
@@ -66,13 +73,8 @@ impl CompanionApp {
             status: Status::Idle,
             owner_id: None,
             roster: None,
-            code: String::new(),
-            busy: false,
-            error: None,
-            notice: None,
-            help_open: false,
-            last_event: None,
-            startup_error,
+            link_url: None,
+            error,
             updates: Some(UpdateChecker::spawn()),
             update: None,
         }
@@ -83,105 +85,60 @@ impl CompanionApp {
         for event in events {
             match event {
                 Event::Status(status) => {
-                    if matches!(status, Status::Pairing) {
-                        self.busy = true;
-                    }
                     match &status {
                         Status::NeedsPairing { steam_id64 } | Status::Watching { steam_id64 } => {
-                            if self
-                                .owner_id
-                                .as_deref()
-                                .is_some_and(|old| old != steam_id64)
-                            {
-                                self.busy = false;
+                            if self.owner_id.as_deref() != Some(steam_id64) {
                                 self.roster = None;
-                                self.code.clear();
                                 self.error = None;
-                                self.notice = None;
                             }
                             self.owner_id = Some(steam_id64.clone());
                         }
                         Status::SignedOut => {
-                            self.busy = false;
                             self.owner_id = None;
                             self.roster = None;
-                            self.code.clear();
-                            self.notice = None;
                         }
                         _ => {}
                     }
-                    self.status = status;
-                    self.last_event = Some("Статус обновлён".into());
+                    // While the browser is open the worker keeps reporting the account; the
+                    // waiting screen stays until the link resolves.
+                    if self.link_url.is_none() || matches!(status, Status::Linking) {
+                        self.status = status;
+                    }
+                }
+                Event::OpenUrl(url) => {
+                    ctx.open_url(egui::OpenUrl::new_tab(url.clone()));
+                    self.link_url = Some(url);
+                    self.status = Status::Linking;
                 }
                 Event::PairComplete { steam_id64 } => {
-                    self.busy = false;
-                    self.code.clear();
+                    self.link_url = None;
                     self.error = None;
-                    self.notice =
-                        Some("Устройство подключено. Включаем наблюдение за Steam…".into());
-                    if self
-                        .owner_id
-                        .as_deref()
-                        .is_some_and(|old| old != steam_id64)
-                    {
-                        self.roster = None;
-                    }
-                    self.owner_id = Some(steam_id64);
-                    if let Err(error) = self.send(Command::Start) {
-                        self.busy = false;
-                        self.notice = None;
-                        self.error = Some(humanize_error(&error));
-                    }
-                    self.last_event = Some("Устройство подключено".into());
+                    self.owner_id = Some(steam_id64.clone());
+                    self.status = Status::Watching { steam_id64 };
+                    let _ = self.send(Command::Start);
                 }
                 Event::Roster(roster) => {
                     self.error = None;
-                    self.notice = None;
                     self.owner_id = Some(roster.owner_steamid64.clone());
                     self.roster = Some(roster);
-                    self.last_event = Some("Список игроков обновлён".into());
                 }
                 Event::Error(message) => {
-                    self.busy = false;
+                    if self.link_url.take().is_some() {
+                        self.status = match &self.owner_id {
+                            Some(id) => Status::NeedsPairing {
+                                steam_id64: id.clone(),
+                            },
+                            None => Status::SignedOut,
+                        };
+                    }
                     self.error = Some(humanize_error(&message));
-                    self.notice = None;
-                    self.last_event = Some("Требуется внимание".into());
                 }
             }
         }
         if let Some(update) = self.updates.as_ref().and_then(UpdateChecker::poll) {
             self.update = Some(update);
         }
-        ctx.request_repaint_after(Duration::from_millis(160));
-    }
-
-    fn paired(&self) -> bool {
-        matches!(self.status, Status::Watching { .. } | Status::Stopped) && self.owner_id.is_some()
-    }
-
-    fn connect(&mut self) {
-        let code: String = self
-            .code
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .take(12)
-            .collect();
-        if code.len() != 12 {
-            self.error = Some("Проверьте код: в нём должно быть 12 букв или цифр.".into());
-            return;
-        }
-        self.code = code.clone();
-        self.error = None;
-        self.notice = Some("Подключаем устройство… Обычно это занимает несколько секунд.".into());
-        self.busy = true;
-        if let Err(err) = self.send(Command::Pair {
-            code,
-            server: DEFAULT_SERVER.into(),
-        }) {
-            self.busy = false;
-            self.notice = None;
-            self.error = Some(humanize_error(&err.to_string()));
-        }
+        ctx.request_repaint_after(Duration::from_millis(100));
     }
 
     fn send(&self, command: Command) -> Result<(), String> {
@@ -192,513 +149,313 @@ impl CompanionApp {
             .map_err(|error| error.to_string())
     }
 
-    fn status_visual(&self) -> (Color32, &'static str, &'static str) {
+    fn headline(&self) -> Headline {
+        let account = self
+            .owner_id
+            .as_deref()
+            .map(|id| format!("Steam · {}", short_id(id)))
+            .unwrap_or_default();
         match &self.status {
-            Status::Idle => (AMBER, "…", "Ожидание Steam"),
-            Status::SignedOut => (AMBER, "!", "Steam не запущен"),
-            Status::NeedsPairing { .. } => (LINK, "•", "Steam обнаружен"),
-            Status::Pairing => (ACCENT, "…", "Подключение"),
-            Status::Watching { .. } => (GREEN, "✓", "Подключено"),
-            Status::Stopped => (AMBER, "Ⅱ", "Наблюдение остановлено"),
+            Status::Idle => Headline {
+                color: FAINT,
+                pulse: true,
+                title: "Ищем Steam",
+                detail: "Секунду…".into(),
+            },
+            Status::SignedOut => Headline {
+                color: AMBER,
+                pulse: false,
+                title: "Steam не запущен",
+                detail: "Откройте Steam и войдите в аккаунт".into(),
+            },
+            Status::NeedsPairing { .. } => Headline {
+                color: TEXT,
+                pulse: false,
+                title: "Подключите компьютер",
+                detail: account,
+            },
+            Status::Linking => Headline {
+                color: MINT,
+                pulse: true,
+                title: "Подтвердите в браузере",
+                detail: "Войдите тем же аккаунтом Steam".into(),
+            },
+            Status::Watching { .. } => {
+                let stale = self.roster.as_ref().is_some_and(|r| {
+                    r.observed_at.elapsed().unwrap_or_default() > Duration::from_secs(120)
+                });
+                Headline {
+                    color: if stale { AMBER } else { MINT },
+                    pulse: !stale,
+                    title: "Подключено",
+                    detail: account,
+                }
+            }
+            Status::Stopped => Headline {
+                color: FAINT,
+                pulse: false,
+                title: "На паузе",
+                detail: account,
+            },
         }
     }
 
-    fn render_header(&self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            brand_mark(ui, &self.logo);
-            ui.add_space(11.0);
-            ui.vertical(|ui| {
-                ui.label(
-                    RichText::new("OPSearch")
-                        .font(FontId::new(15.0, FontFamily::Name(Arc::from("unbounded"))))
-                        .color(TEXT),
-                );
-                ui.label(
-                    RichText::new(format!("Companion · v{CURRENT_VERSION}"))
-                        .size(10.0)
-                        .color(DIM),
-                );
-            });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let (color, glyph, label) = self.status_visual();
-                status_pill(ui, color, glyph, label);
-            });
-        });
-        ui.add_space(17.0);
-        ui.separator();
-        ui.add_space(18.0);
-    }
-
-    fn render_update(&self, ui: &mut egui::Ui) {
-        let Some(update) = &self.update else { return };
-        egui::Frame::new()
-            .fill(ACCENT.gamma_multiply(0.08))
-            .stroke(Stroke::new(1.0, ACCENT.gamma_multiply(0.3)))
-            .corner_radius(egui::CornerRadius::same(14))
-            .inner_margin(egui::Margin::symmetric(16, 12))
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    status_dot(ui, ACCENT);
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new(format!("Доступна версия {}", update.version))
-                                .size(13.0)
-                                .strong()
-                                .color(TEXT),
-                        );
-                        ui.label(
-                            RichText::new(format!(
-                                "У вас {CURRENT_VERSION}. Скачайте новую сборку и замените ею этот файл."
-                            ))
-                            .size(11.0)
-                            .color(MUTED),
-                        );
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let button = egui::Button::new(
-                            RichText::new("Скачать")
-                                .size(12.0)
-                                .strong()
-                                .color(ON_PRIMARY),
-                        )
-                        .fill(PRIMARY)
-                        .corner_radius(9.0)
-                        .min_size(Vec2::new(96.0, 34.0));
-                        if ui.add(button).clicked() {
-                            ui.ctx()
-                                .open_url(egui::OpenUrl::new_tab(update.url.clone()));
-                        }
-                    });
-                });
-            });
-        ui.add_space(16.0);
-    }
-
-    fn render_hero(&self, ui: &mut egui::Ui) {
-        ui.label(
-            RichText::new("ПРИЛОЖЕНИЕ ДЛЯ WINDOWS")
-                .size(10.0)
-                .strong()
-                .color(DIM),
+    fn title_bar(&self, ui: &mut egui::Ui) {
+        let rect = Rect::from_min_size(
+            ui.max_rect().min,
+            Vec2::new(ui.max_rect().width(), TITLE_BAR),
         );
-        ui.add_space(7.0);
-        ui.label(
-            RichText::new("CS2 Desktop Companion")
-                .font(FontId::new(26.0, FontFamily::Name(Arc::from("unbounded"))))
-                .color(TEXT),
+        let drag = ui.interact(
+            rect,
+            ui.scope_id().with("title-drag"),
+            Sense::click_and_drag(),
         );
-        ui.add_space(8.0);
-        ui.label(
-            RichText::new("Подключите приложение, чтобы видеть недавно замеченных игроков CS2 в OPSearch. Данные Steam могут быть неполными.")
-                .size(12.0)
-                .color(MUTED),
+        if drag.drag_started() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        let painter = ui.painter();
+        let logo_rect = Rect::from_center_size(
+            Pos2::new(rect.left() + PAD + 11.0, rect.center().y),
+            Vec2::splat(22.0),
         );
-        ui.add_space(18.0);
+        painter.image(
+            self.logo.id(),
+            logo_rect,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        painter.text(
+            Pos2::new(logo_rect.right() + 10.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            "OPSearch",
+            FontId::new(13.0, display_font()),
+            TEXT,
+        );
+
+        let close = Rect::from_center_size(
+            Pos2::new(rect.right() - 24.0, rect.center().y),
+            Vec2::splat(30.0),
+        );
+        let minimize = close.translate(Vec2::new(-34.0, 0.0));
+        if window_button(ui, close, "close", RED) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if window_button(ui, minimize, "minimize", TEXT) {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
     }
 
-    fn render_account(&self, ui: &mut egui::Ui) {
-        card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new("АККАУНТ STEAM")
-                            .size(10.0)
-                            .strong()
-                            .color(MUTED),
-                    );
-                    ui.add_space(5.0);
-                    match &self.owner_id {
-                        Some(id) => {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(format!("SteamID64  {id}"))
-                                        .size(15.0)
-                                        .monospace()
-                                        .color(TEXT),
-                                );
-                                let copy = ui.add(
-                                    egui::Button::new(
-                                        RichText::new("Копировать").size(10.0).color(LINK),
-                                    )
-                                    .fill(Color32::TRANSPARENT)
-                                    .stroke(Stroke::new(1.0, BORDER))
-                                    .corner_radius(egui::CornerRadius::same(7))
-                                    .min_size(Vec2::new(86.0, 28.0)),
-                                );
-                                if copy.clicked() {
-                                    ui.ctx().copy_text(id.clone());
-                                }
-                            });
-                            ui.add_space(3.0);
-                            ui.label(
-                                RichText::new("Этот аккаунт используется для синхронизации")
-                                    .size(12.0)
-                                    .color(MUTED),
-                            );
-                        }
-                        None => {
-                            ui.label(
-                                RichText::new("Ожидаем Steam")
-                                    .size(16.0)
-                                    .strong()
-                                    .color(TEXT),
-                            );
-                            ui.add_space(3.0);
-                            ui.label(
-                                RichText::new("Запустите Steam и войдите в свой аккаунт")
-                                    .size(12.0)
-                                    .color(MUTED),
-                            );
-                        }
-                    }
-                });
-            });
-        });
-    }
-
-    fn render_pairing(&mut self, ui: &mut egui::Ui) {
-        card(ui, |ui| {
-            ui.label(
-                RichText::new("ПОДКЛЮЧЕНИЕ УСТРОЙСТВА")
-                    .size(10.0)
-                    .strong()
-                    .color(DIM),
-            );
-            ui.add_space(5.0);
-            ui.label(
-                RichText::new("Подключить компьютер")
-                    .font(FontId::new(16.0, FontFamily::Name(Arc::from("unbounded"))))
-                    .color(TEXT),
-            );
-            ui.label(
-                RichText::new(
-                    "Введите код с сайта OPSearch, чтобы связать этот компьютер с аккаунтом Steam.",
-                )
-                .size(12.0)
-                .color(MUTED),
-            );
+    fn status_block(&mut self, ui: &mut egui::Ui) {
+        let head = self.headline();
+        ui.add_space(26.0);
+        ui.vertical_centered(|ui| {
+            status_orb(ui, head.color, head.pulse);
             ui.add_space(16.0);
             ui.label(
-                RichText::new("КОД ПОДКЛЮЧЕНИЯ")
-                    .size(10.0)
-                    .strong()
-                    .color(MUTED),
+                RichText::new(head.title)
+                    .font(FontId::new(20.0, display_font()))
+                    .color(TEXT),
             );
-            ui.add_space(7.0);
-            ui.horizontal(|ui| {
-                let field = egui::TextEdit::singleline(&mut self.code)
-                    .font(FontId::monospace(16.0))
-                    .char_limit(12)
-                    .desired_width(205.0)
-                    .margin(Vec2::new(12.0, 11.0))
-                    .hint_text("Вставьте код с сайта OPSearch");
-                let response = ui.add_sized([236.0, 46.0], field);
-                if response.changed() {
-                    self.code = self
-                        .code
-                        .chars()
-                        .filter(|c| c.is_ascii_alphanumeric())
-                        .map(|c| c.to_ascii_uppercase())
-                        .take(12)
-                        .collect();
+            ui.add_space(4.0);
+            ui.label(RichText::new(&head.detail).size(13.0).color(MUTED));
+        });
+        ui.add_space(20.0);
+
+        match &self.status {
+            Status::NeedsPairing { .. } => {
+                if primary_button(ui, "Подключить через Steam", true) {
                     self.error = None;
-                }
-                ui.add_space(10.0);
-                let button = egui::Button::new(
-                    RichText::new(if self.busy {
-                        "Подключаем…"
-                    } else {
-                        "Подключить"
-                    })
-                    .size(14.0)
-                    .strong()
-                    .color(ON_PRIMARY),
-                )
-                .fill(if self.busy { MUTED } else { PRIMARY })
-                .corner_radius(10.0)
-                .min_size(Vec2::new(145.0, 46.0));
-                if ui
-                    .add_enabled(
-                        !self.busy && matches!(self.status, Status::NeedsPairing { .. }),
-                        button,
-                    )
-                    .clicked()
-                {
-                    self.connect();
-                }
-            });
-            ui.add_space(8.0);
-            if matches!(self.status, Status::SignedOut | Status::Idle) {
-                ui.horizontal_wrapped(|ui| {
-                    status_dot(ui, AMBER);
-                    ui.label(RichText::new("Сначала запустите Steam и войдите в аккаунт — после этого можно подключить устройство.")
-                        .size(11.0).color(MUTED));
-                });
-            }
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("Код действует, пока не будет использован или заменён новым.")
-                        .size(11.0)
-                        .color(DIM),
-                );
-                let link = ui.add(
-                    egui::Label::new(
-                        RichText::new("Получить код на сайте")
-                            .size(11.0)
-                            .color(LINK)
-                            .underline(),
-                    )
-                    .sense(Sense::click()),
-                );
-                if link.clicked() {
-                    ui.ctx()
-                        .open_url(egui::OpenUrl::new_tab("https://opsearch.pro/companion"));
-                }
-            });
-            self.render_feedback(ui);
-        });
-    }
-
-    fn render_monitoring(&mut self, ui: &mut egui::Ui) {
-        card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new("СОСТОЯНИЕ УСТРОЙСТВА")
-                            .size(10.0)
-                            .strong()
-                            .color(DIM),
-                    );
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new("Синхронизация")
-                            .font(FontId::new(16.0, FontFamily::Name(Arc::from("unbounded"))))
-                            .color(TEXT),
-                    );
-                    ui.label(
-                        RichText::new("Список недавних игроков CS2")
-                            .size(12.0)
-                            .color(MUTED),
-                    );
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let watching = matches!(self.status, Status::Watching { .. });
-                    let label = if watching {
-                        "Остановить"
-                    } else {
-                        "Запустить"
-                    };
-                    let fill = if watching { SURFACE_RAISED } else { PRIMARY };
-                    let text_color = if watching { TEXT } else { ON_PRIMARY };
-                    let button = egui::Button::new(
-                        RichText::new(label).size(12.0).strong().color(text_color),
-                    )
-                    .fill(fill)
-                    .stroke(Stroke::new(1.0, if watching { BORDER } else { PRIMARY }))
-                    .corner_radius(9.0)
-                    .min_size(Vec2::new(112.0, 40.0));
-                    if ui.add_enabled(!self.busy, button).clicked() {
-                        self.error = None;
-                        let command = if watching {
-                            Command::Stop
-                        } else {
-                            Command::Start
-                        };
-                        if let Err(err) = self.send(command) {
-                            self.error = Some(humanize_error(&err));
-                        } else if watching {
-                            self.notice = Some(
-                                "Наблюдение остановлено. Его можно включить снова в любой момент."
-                                    .into(),
-                            );
-                        } else {
-                            self.notice = Some("Ищем свежие данные Steam…".into());
-                        }
+                    if let Err(error) = self.send(Command::Link {
+                        server: DEFAULT_SERVER.into(),
+                    }) {
+                        self.error = Some(humanize_error(&error));
                     }
-                });
-            });
-            ui.add_space(13.0);
-            ui.horizontal(|ui| {
-                metric(
-                    ui,
-                    "ИГРОКОВ",
-                    self.roster
-                        .as_ref()
-                        .map(|r| r.players.len().to_string())
-                        .unwrap_or_else(|| "—".into()),
-                );
-                ui.add_space(8.0);
-                metric(
-                    ui,
-                    "ПОСЛЕДНЕЕ ОБНОВЛЕНИЕ",
-                    self.roster
-                        .as_ref()
-                        .map(|r| local_time(r.observed_at))
-                        .unwrap_or_else(|| "Ожидаем данные".into()),
-                );
-                if let Some(roster) = &self.roster {
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let stale = roster.observed_at.elapsed().unwrap_or_default()
-                            > Duration::from_secs(120);
-                        status_pill(
-                            ui,
-                            if stale { AMBER } else { GREEN },
-                            if stale { "!" } else { "✓" },
-                            if stale {
-                                "Данные устарели"
-                            } else {
-                                "Актуально"
+                }
+            }
+            Status::Linking => {
+                ui.columns(2, |cols| {
+                    if secondary_button(&mut cols[0], "Открыть снова")
+                        && let Some(url) = &self.link_url
+                    {
+                        cols[0].ctx().open_url(egui::OpenUrl::new_tab(url.clone()));
+                    }
+                    if secondary_button(&mut cols[1], "Отмена") {
+                        let _ = self.send(Command::CancelLink);
+                        self.link_url = None;
+                        self.status = match &self.owner_id {
+                            Some(id) => Status::NeedsPairing {
+                                steam_id64: id.clone(),
                             },
-                        );
-                    });
-                }
-            });
-            self.render_feedback(ui);
-        });
-
-        ui.add_space(14.0);
-        card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("НЕДАВНИЕ ИГРОКИ")
-                        .size(10.0)
-                        .strong()
-                        .color(MUTED),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if self.roster.is_some() {
-                        ui.label(RichText::new("CS2 · App 730").size(10.0).color(DIM));
+                            None => Status::SignedOut,
+                        };
                     }
                 });
-            });
-            ui.add_space(10.0);
-            if let Some(roster) = &self.roster {
-                if roster.players.is_empty() {
-                    empty_state(
-                        ui,
-                        "Пока нет недавних игроков",
-                        "Когда Steam обновит список, игроки появятся здесь.",
-                    );
-                } else {
-                    egui::ScrollArea::vertical()
-                        .max_height(230.0)
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            for (index, player) in roster.players.iter().enumerate() {
-                                player_row(ui, player, index + 1);
-                                if index + 1 < roster.players.len() {
-                                    ui.add_space(2.0);
-                                }
-                            }
-                        });
-                }
-            } else {
-                empty_state(
-                    ui,
-                    "Ждём данные Steam",
-                    "Оставьте Steam открытым — синхронизация начнётся автоматически.",
-                );
             }
-        });
-    }
+            _ => {}
+        }
 
-    fn render_feedback(&mut self, ui: &mut egui::Ui) {
-        if let Some(error) = self.error.as_ref() {
-            ui.add_space(12.0);
-            ui.horizontal_wrapped(|ui| {
-                status_dot(ui, RED);
+        if let Some(error) = &self.error {
+            ui.add_space(10.0);
+            ui.vertical_centered(|ui| {
                 ui.label(RichText::new(error).size(12.0).color(RED));
-            });
-        } else if let Some(notice) = self.notice.as_ref() {
-            ui.add_space(12.0);
-            ui.horizontal_wrapped(|ui| {
-                status_dot(ui, LINK);
-                ui.label(RichText::new(notice).size(12.0).color(MUTED));
             });
         }
     }
 
-    fn render_help(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(12.0);
-        egui::CollapsingHeader::new(RichText::new("Как это работает и что читает приложение").size(11.0).color(MUTED))
-            .default_open(self.help_open)
-            .show(ui, |ui| {
-                ui.add_space(4.0);
-                ui.label(RichText::new("Приложение читает локальный список недавних игроков Steam и отправляет его в OPSearch для подключённого аккаунта.").size(11.0).color(MUTED));
-                ui.add_space(4.0);
-                if let Some(event) = &self.last_event {
-                    ui.label(RichText::new(format!("Последнее событие: {event}")).size(10.0).color(DIM));
+    fn lobby(&self, ui: &mut egui::Ui, height: f32) {
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
+        if !matches!(self.status, Status::Watching { .. } | Status::Stopped) {
+            return;
+        }
+        let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("ЛОББИ").size(10.0).strong().color(FAINT));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if let Some(roster) = &self.roster {
+                    ui.label(
+                        RichText::new(relative_time(roster.observed_at))
+                            .size(11.0)
+                            .color(FAINT),
+                    );
                 }
-                ui.label(RichText::new("Оно не обращается к памяти игры и не запускает её.").size(11.0).color(MUTED));
             });
+        });
+        ui.add_space(6.0);
+        let Some(roster) = &self.roster else {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new("Появится после матча")
+                        .size(13.0)
+                        .color(MUTED),
+                );
+                ui.label(
+                    RichText::new("Оставьте Steam открытым")
+                        .size(11.0)
+                        .color(FAINT),
+                );
+            });
+            return;
+        };
+        let others: Vec<&Player> = roster
+            .players
+            .iter()
+            .filter(|p| p.steamid64 != roster.owner_steamid64)
+            .collect();
+        if others.is_empty() {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("Пока никого").size(13.0).color(MUTED));
+            });
+            return;
+        }
+        // As many rows as the window holds; the rest are counted, never scrolled.
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let fit = ((ui.available_height() / ROW).floor() as usize).min(MAX_ROWS);
+        let shown = if others.len() > fit {
+            fit.saturating_sub(1)
+        } else {
+            others.len()
+        };
+        for player in others.iter().take(shown) {
+            player_row(&mut ui, player);
+        }
+        if others.len() > shown
+            && text_link(
+                &mut ui,
+                &format!("и ещё {} — открыть на сайте", others.len() - shown),
+                MUTED,
+            )
+        {
+            ui.ctx()
+                .open_url(egui::OpenUrl::new_tab(DEFAULT_SERVER.to_owned()));
+        }
+    }
+
+    fn footer(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("v{CURRENT_VERSION}"))
+                    .size(11.0)
+                    .color(FAINT),
+            );
+            if let Some(update) = &self.update
+                && text_link(ui, &format!("Обновить до {}", update.version), MINT)
+            {
+                ui.ctx()
+                    .open_url(egui::OpenUrl::new_tab(update.url.clone()));
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let toggle = match self.status {
+                    Status::Watching { .. } => Some(("Пауза", MUTED, Command::Stop)),
+                    Status::Stopped => Some(("Продолжить", MINT, Command::Start)),
+                    _ => None,
+                };
+                if let Some((label, color, command)) = toggle
+                    && text_link(ui, label, color)
+                {
+                    let _ = self.send(command);
+                }
+                if matches!(self.status, Status::Watching { .. } | Status::Stopped)
+                    && let Some(id) = self.owner_id.clone()
+                    && text_link(ui, "Профиль", MUTED)
+                {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(format!(
+                        "{DEFAULT_SERVER}/profiles/{id}"
+                    )));
+                }
+                if text_link(ui, "Сайт", MUTED) {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(format!(
+                        "{DEFAULT_SERVER}/companion"
+                    )));
+                }
+            });
+        });
     }
 }
 
 impl eframe::App for CompanionApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Rgba::from(BG).to_array()
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.receive_events(ui.ctx());
+        self.draw(ui);
+    }
+}
+
+impl CompanionApp {
+    fn draw(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(BG)
-                    .inner_margin(egui::Margin::same(22)),
-            )
+            .frame(egui::Frame::new().fill(BG))
             .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        self.render_header(ui);
-                        self.render_update(ui);
-                        if let Some(error) = &self.startup_error {
-                            card(ui, |ui| {
-                                ui.horizontal_wrapped(|ui| {
-                                    status_dot(ui, RED);
-                                    ui.label(RichText::new(error).size(12.0).color(RED));
-                                });
-                            });
-                            ui.add_space(14.0);
-                        }
-                        self.render_hero(ui);
-                        self.render_account(ui);
-                        ui.add_space(14.0);
-                        if self.paired() {
-                            self.render_monitoring(ui);
-                        } else {
-                            self.render_pairing(ui);
-                        }
-                        self.render_help(ui);
-                        ui.add_space(14.0);
-                        ui.separator();
-                        ui.add_space(9.0);
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(
-                                RichText::new(
-                                    "Читает локальный список Steam. Без доступа к памяти игры.",
-                                )
-                                .size(10.0)
-                                .color(DIM),
-                            );
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let link = ui.add(
-                                    egui::Label::new(
-                                        RichText::new("Исходный код ↗")
-                                            .size(10.0)
-                                            .color(MUTED)
-                                            .underline(),
-                                    )
-                                    .sense(Sense::click()),
-                                );
-                                if link.clicked() {
-                                    ui.ctx().open_url(egui::OpenUrl::new_tab(
-                                        "https://github.com/MascotWorld/opsearch-companion",
-                                    ));
-                                }
-                            });
-                        });
-                    });
+                let full = ui.max_rect();
+                paint_backdrop(ui, full);
+                self.title_bar(ui);
+
+                let body = Rect::from_min_max(
+                    Pos2::new(full.left() + PAD, full.top() + TITLE_BAR),
+                    Pos2::new(full.right() - PAD, full.bottom() - 14.0),
+                );
+                let mut body_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(body)
+                        .layout(Layout::top_down(Align::Min)),
+                );
+                self.status_block(&mut body_ui);
+                body_ui.add_space(18.0);
+                let lobby_height = body_ui.available_height() - 30.0;
+                self.lobby(&mut body_ui, lobby_height.max(0.0));
+                self.footer(&mut body_ui);
             });
     }
+}
+
+fn display_font() -> FontFamily {
+    FontFamily::Name(Arc::from("unbounded"))
 }
 
 fn apply_theme(ctx: &egui::Context) {
@@ -720,10 +477,9 @@ fn apply_theme(ctx: &egui::Context) {
         .entry(FontFamily::Proportional)
         .or_default()
         .insert(0, "onest".to_owned());
-    fonts.families.insert(
-        FontFamily::Name(Arc::from("unbounded")),
-        vec!["unbounded".to_owned()],
-    );
+    fonts
+        .families
+        .insert(display_font(), vec!["unbounded".to_owned()]);
     ctx.set_fonts(fonts);
 
     let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
@@ -732,174 +488,207 @@ fn apply_theme(ctx: &egui::Context) {
     style.visuals.panel_fill = BG;
     style.visuals.window_fill = SURFACE;
     style.visuals.extreme_bg_color = BG;
-    style.visuals.text_edit_bg_color = Some(Color32::from_rgb(16, 18, 23));
-    style.visuals.faint_bg_color = SURFACE_RAISED;
-    style.visuals.widgets.noninteractive.bg_fill = SURFACE;
-    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
-    style.visuals.widgets.inactive.bg_fill = SURFACE_RAISED;
-    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
-    style.visuals.widgets.inactive.weak_bg_fill = SURFACE_RAISED;
-    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
-    style.visuals.widgets.hovered.bg_fill = SURFACE_HOVER;
-    style.visuals.widgets.hovered.weak_bg_fill = SURFACE_HOVER;
-    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(64, 68, 76));
-    style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
-    style.visuals.widgets.active.bg_fill = Color32::from_rgb(52, 56, 64);
-    style.visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
     style.visuals.selection.bg_fill = Color32::from_rgb(64, 92, 76);
-    style.visuals.selection.stroke = Stroke::new(1.0, ACCENT);
-    style.visuals.hyperlink_color = ACCENT;
+    style.visuals.hyperlink_color = MINT;
     style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
-    style.visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(8);
-    style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(8);
-    style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(8);
-    style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(8);
-    style.spacing.item_spacing = Vec2::new(8.0, 8.0);
-    style.spacing.button_padding = Vec2::new(14.0, 8.0);
+    style.spacing.item_spacing = Vec2::new(8.0, 6.0);
     ctx.set_style_of(egui::Theme::Dark, style);
-    // egui follows the system theme by default, and only the dark style is customised: with a
-    // light Windows theme the text field and separators came out white.
+    // Only the dark style is customised; a light Windows theme must not switch to egui's light one.
     ctx.set_theme(egui::ThemePreference::Dark);
 }
 
-fn card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    egui::Frame::new()
-        .fill(SURFACE)
-        .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(egui::CornerRadius::same(16))
-        .inner_margin(egui::Margin::same(16))
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            add_contents(ui)
-        })
-        .inner
-}
-
-fn brand_mark(ui: &mut egui::Ui, logo: &egui::TextureHandle) {
-    ui.add(egui::Image::new((logo.id(), Vec2::splat(40.0))));
-}
-
-pub fn window_icon() -> std::sync::Arc<egui::IconData> {
-    std::sync::Arc::new(
+pub fn window_icon() -> Arc<egui::IconData> {
+    Arc::new(
         eframe::icon_data::from_png_bytes(include_bytes!(concat!(
             env!("OUT_DIR"),
             "/opsearch-icon-v1.png"
         )))
-        .expect("valid OPSearch v1 icon PNG"),
+        .expect("embedded OPSearch icon decodes"),
     )
 }
 
-fn status_pill(ui: &mut egui::Ui, color: Color32, glyph: &str, label: &str) {
-    egui::Frame::new()
-        .fill(color.gamma_multiply(0.13))
-        .stroke(Stroke::new(1.0, color.gamma_multiply(0.38)))
-        .corner_radius(egui::CornerRadius::same(20))
-        .inner_margin(egui::Margin::symmetric(10, 6))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(glyph).size(11.0).strong().color(color));
-                ui.label(RichText::new(label).size(10.0).strong().color(color));
-            });
-        });
+/// A soft light from the top and a hairline border, so the frameless window has an edge.
+fn paint_backdrop(ui: &egui::Ui, rect: Rect) {
+    let painter = ui.painter();
+    let mut mesh = egui::Mesh::default();
+    let mid = Pos2::new(rect.right(), rect.top() + 220.0);
+    mesh.colored_vertex(rect.left_top(), BG_TOP);
+    mesh.colored_vertex(rect.right_top(), BG_TOP);
+    mesh.colored_vertex(Pos2::new(rect.left(), mid.y), BG);
+    mesh.colored_vertex(mid, BG);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(1, 2, 3);
+    painter.add(mesh);
+    painter.rect_stroke(
+        rect.shrink(0.5),
+        CornerRadius::ZERO,
+        Stroke::new(1.0, BORDER),
+        StrokeKind::Inside,
+    );
 }
 
-fn metric(ui: &mut egui::Ui, label: &str, value: String) {
-    egui::Frame::new()
-        .fill(SURFACE_RAISED)
-        .corner_radius(egui::CornerRadius::same(9))
-        .inner_margin(egui::Margin::symmetric(11, 8))
-        .show(ui, |ui| {
-            ui.vertical(|ui| {
-                ui.label(RichText::new(label).size(9.0).strong().color(DIM));
-                ui.label(RichText::new(value).size(12.0).color(TEXT));
-            });
-        });
+fn window_button(ui: &mut egui::Ui, rect: Rect, kind: &str, hover_color: Color32) -> bool {
+    let response = ui
+        .interact(rect, ui.scope_id().with(kind), Sense::click())
+        .on_hover_cursor(CursorIcon::PointingHand);
+    let painter = ui.painter();
+    if response.hovered() {
+        painter.rect_filled(rect, CornerRadius::same(8), SURFACE_HOVER);
+    }
+    let color = if response.hovered() {
+        hover_color
+    } else {
+        MUTED
+    };
+    let stroke = Stroke::new(1.4, color);
+    let c = rect.center();
+    if kind == "close" {
+        let d = 5.0;
+        painter.line_segment([c + Vec2::new(-d, -d), c + Vec2::new(d, d)], stroke);
+        painter.line_segment([c + Vec2::new(-d, d), c + Vec2::new(d, -d)], stroke);
+    } else {
+        painter.line_segment([c + Vec2::new(-5.0, 0.0), c + Vec2::new(5.0, 0.0)], stroke);
+    }
+    response.clicked()
 }
 
-fn player_row(ui: &mut egui::Ui, player: &Player, rank: usize) {
-    ui.horizontal(|ui| {
-        egui::Frame::new()
-            .fill(SURFACE_RAISED)
-            .corner_radius(egui::CornerRadius::same(7))
-            .inner_margin(egui::Margin::symmetric(8, 6))
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new(format!("{rank:02}"))
-                        .size(10.0)
-                        .monospace()
-                        .color(MUTED),
-                );
-            });
-        ui.add_space(5.0);
-        ui.vertical(|ui| {
-            ui.label(
-                RichText::new(&player.steamid64)
-                    .size(12.0)
-                    .monospace()
-                    .color(TEXT),
-            );
-            ui.label(RichText::new("SteamID64").size(9.0).color(DIM));
-        });
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let played = unix_local_time(player.playtime);
-            let link = ui.add(
-                egui::Label::new(
-                    RichText::new("Профиль ↗")
-                        .size(10.0)
-                        .color(LINK)
-                        .underline(),
-                )
-                .sense(Sense::click()),
-            );
-            if link.clicked() {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(format!(
-                    "https://opsearch.pro/profiles/{}",
-                    player.steamid64
-                )));
-            }
-            ui.add_space(10.0);
-            ui.label(RichText::new(played).size(10.0).color(MUTED));
-        });
-    });
-    ui.add_space(7.0);
-    ui.separator();
-    ui.add_space(5.0);
+fn status_orb(ui: &mut egui::Ui, color: Color32, pulse: bool) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(64.0), Sense::hover());
+    let painter = ui.painter();
+    let c = rect.center();
+    if pulse {
+        let t = (ui.input(|i| i.time) % 2.0) as f32 / 2.0;
+        let radius = 14.0 + t * 18.0;
+        painter.circle_filled(c, radius, color.gamma_multiply(0.35 * (1.0 - t)));
+    }
+    painter.circle_filled(c, 26.0, color.gamma_multiply(0.08));
+    painter.circle_stroke(c, 26.0, Stroke::new(1.0, color.gamma_multiply(0.35)));
+    painter.circle_filled(c, 8.0, color);
 }
 
-fn empty_state(ui: &mut egui::Ui, title: &str, detail: &str) {
-    egui::Frame::new()
-        .fill(SURFACE_RAISED)
-        .corner_radius(egui::CornerRadius::same(10))
-        .inner_margin(egui::Margin::symmetric(14, 16))
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.vertical_centered(|ui| {
-                ui.label(RichText::new(title).size(13.0).strong().color(TEXT));
-                ui.add_space(4.0);
-                ui.label(RichText::new(detail).size(11.0).color(MUTED));
-            });
-        });
+fn primary_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> bool {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 46.0), Sense::click());
+    let response = if enabled {
+        response.on_hover_cursor(CursorIcon::PointingHand)
+    } else {
+        response
+    };
+    let fill = if !enabled {
+        MUTED
+    } else if response.is_pointer_button_down_on() {
+        Color32::from_rgb(220, 224, 230)
+    } else if response.hovered() {
+        Color32::WHITE
+    } else {
+        PRIMARY
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(13), fill);
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(14.0),
+        ON_PRIMARY,
+    );
+    enabled && response.clicked()
 }
 
-fn status_dot(ui: &mut egui::Ui, color: Color32) {
-    let (response, painter) = ui.allocate_painter(Vec2::splat(8.0), Sense::hover());
-    painter.circle_filled(response.rect.center(), 3.0, color);
+fn secondary_button(ui: &mut egui::Ui, label: &str) -> bool {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 42.0), Sense::click());
+    let response = response.on_hover_cursor(CursorIcon::PointingHand);
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        CornerRadius::same(12),
+        if response.hovered() {
+            SURFACE_HOVER
+        } else {
+            SURFACE
+        },
+    );
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(12),
+        Stroke::new(1.0, BORDER),
+        StrokeKind::Inside,
+    );
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(13.0),
+        TEXT,
+    );
+    response.clicked()
 }
 
-fn unix_local_time(timestamp: i64) -> String {
-    Local
-        .timestamp_opt(timestamp, 0)
-        .single()
-        .map(|dt| dt.format("%d.%m.%Y · %H:%M").to_string())
-        .unwrap_or_else(|| "Дата недоступна".into())
+fn text_link(ui: &mut egui::Ui, label: &str, color: Color32) -> bool {
+    let response = ui
+        .add(egui::Label::new(RichText::new(label).size(11.0).color(color)).sense(Sense::click()))
+        .on_hover_cursor(CursorIcon::PointingHand);
+    if response.hovered() {
+        let r = response.rect;
+        ui.painter().line_segment(
+            [
+                Pos2::new(r.left(), r.bottom()),
+                Pos2::new(r.right(), r.bottom()),
+            ],
+            Stroke::new(1.0, color),
+        );
+    }
+    response.clicked()
 }
 
-fn local_time(time: SystemTime) -> String {
+/// One lobby player: the whole row opens their OPSearch profile.
+fn player_row(ui: &mut egui::Ui, player: &Player) {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW), Sense::click());
+    let response = response
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text("Открыть профиль на OPSearch");
+    let painter = ui.painter();
+    if response.hovered() {
+        painter.rect_filled(rect, CornerRadius::same(8), SURFACE_HOVER);
+    }
+    painter.text(
+        Pos2::new(rect.left() + 10.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        &player.steamid64,
+        FontId::monospace(12.0),
+        if response.hovered() { TEXT } else { MUTED },
+    );
+    painter.text(
+        Pos2::new(rect.right() - 10.0, rect.center().y),
+        Align2::RIGHT_CENTER,
+        if response.hovered() { "↗" } else { "" },
+        FontId::proportional(12.0),
+        MINT,
+    );
+    if response.clicked() {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(format!(
+            "{DEFAULT_SERVER}/profiles/{}",
+            player.steamid64
+        )));
+    }
+}
+
+fn short_id(id: &str) -> String {
+    if id.len() > 8 {
+        format!("…{}", &id[id.len() - 6..])
+    } else {
+        id.to_owned()
+    }
+}
+
+fn relative_time(time: SystemTime) -> String {
     let elapsed = time.elapsed().unwrap_or_default();
     if elapsed < Duration::from_secs(60) {
         "только что".into()
     } else if elapsed < Duration::from_secs(3600) {
-        format!("{} мин. назад", elapsed.as_secs() / 60)
+        format!("{} мин назад", elapsed.as_secs() / 60)
     } else {
         Local
             .timestamp_opt(
@@ -909,31 +698,25 @@ fn local_time(time: SystemTime) -> String {
                 0,
             )
             .single()
-            .map(|dt| dt.format("%d.%m · %H:%M").to_string())
-            .unwrap_or_else(|| "время неизвестно".into())
+            .map(|dt| dt.format("%d.%m %H:%M").to_string())
+            .unwrap_or_default()
     }
 }
 
 fn humanize_error(raw: &str) -> String {
     let lower = raw.to_ascii_lowercase();
-    if lower.contains("pair")
-        || lower.contains("code")
-        || lower.contains("invalid")
-        || lower.contains("http 401")
-        || lower.contains("http 422")
-    {
-        "Не удалось подключить устройство. Проверьте код и попробуйте ещё раз.".into()
+    if lower.contains("not approved in time") {
+        "Не дождались подтверждения. Попробуйте ещё раз.".into()
     } else if lower.contains("steam") || lower.contains("signed out") {
-        "Steam не найден. Запустите Steam и войдите в нужный аккаунт.".into()
+        "Steam не найден. Запустите Steam и войдите в аккаунт.".into()
     } else if lower.contains("network")
         || lower.contains("connect")
         || lower.contains("timeout")
         || lower.contains("http")
     {
-        "Не удалось связаться с OPSearch. Проверьте интернет и повторите попытку.".into()
+        "Нет связи с OPSearch. Проверьте интернет.".into()
     } else {
-        "Что-то пошло не так. Проверьте Steam и подключение к интернету, затем попробуйте снова."
-            .into()
+        "Что-то пошло не так. Попробуйте ещё раз.".into()
     }
 }
 
@@ -941,53 +724,69 @@ fn humanize_error(raw: &str) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn synthetic_paired_screen_renders_without_network_or_steam() {
-        let fake_owner = "synthetic-owner-id".to_owned();
+    fn app(status: Status, roster: Option<Roster>) -> CompanionApp {
         let context = egui::Context::default();
         let logo = context.load_texture(
-            "opsearch-icon-v1-test",
-            egui::ColorImage::from(window_icon().as_ref()),
+            "test-logo",
+            egui::ColorImage::filled([1, 1], Color32::WHITE),
             egui::TextureOptions::LINEAR,
         );
-        let mut app = CompanionApp {
+        CompanionApp {
             logo,
             core: None,
-            status: Status::Watching {
-                steam_id64: fake_owner.clone(),
-            },
-            owner_id: Some(fake_owner.clone()),
-            roster: Some(Roster {
-                owner_steamid64: fake_owner,
-                owner_playtime: 1_800_000_000,
-                observed_at: SystemTime::now(),
-                players: vec![Player {
-                    steamid64: "synthetic-player-id".into(),
-                    playtime: 1_800_000_000,
-                    app_id: 730,
-                }],
-            }),
-            code: String::new(),
-            busy: false,
+            status,
+            owner_id: Some("76561198000000001".into()),
+            roster,
+            link_url: None,
             error: None,
-            notice: None,
-            help_open: false,
-            last_event: None,
-            startup_error: None,
             updates: None,
             update: None,
-        };
-        apply_theme(&context);
-        let mut rendered = context.run_ui(egui::RawInput::default(), |ui| {
-            egui::CentralPanel::default().show(ui, |ui| {
-                app.render_account(ui);
-                app.render_monitoring(ui);
-            });
-        });
+        }
+    }
 
-        assert!(app.paired());
-        assert_eq!(app.roster.as_ref().unwrap().players.len(), 1);
-        assert!(!rendered.shapes.is_empty());
-        rendered.textures_delta.clear();
+    #[test]
+    fn every_state_renders_inside_the_fixed_window() {
+        let roster = Roster {
+            owner_steamid64: "76561198000000001".into(),
+            owner_playtime: 1_800_000_000,
+            observed_at: SystemTime::now(),
+            players: (0..14)
+                .map(|i| Player {
+                    steamid64: format!("765611980000001{i:02}"),
+                    playtime: 1_800_000_000,
+                    app_id: 730,
+                })
+                .collect(),
+        };
+        let owner = "76561198000000001".to_owned();
+        for (status, roster) in [
+            (Status::Idle, None),
+            (Status::SignedOut, None),
+            (
+                Status::NeedsPairing {
+                    steam_id64: owner.clone(),
+                },
+                None,
+            ),
+            (Status::Linking, None),
+            (
+                Status::Watching {
+                    steam_id64: owner.clone(),
+                },
+                Some(roster.clone()),
+            ),
+            (Status::Stopped, None),
+        ] {
+            let mut app = app(status, roster);
+            let context = egui::Context::default();
+            apply_theme(&context);
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::from(WINDOW_SIZE))),
+                ..Default::default()
+            };
+            let mut output = context.run_ui(input, |ui| app.draw(ui));
+            assert!(!output.shapes.is_empty());
+            output.textures_delta.clear();
+        }
     }
 }

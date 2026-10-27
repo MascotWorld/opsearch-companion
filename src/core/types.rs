@@ -17,6 +17,8 @@ pub enum CoreError {
     Network,
     #[error("the companion worker is no longer available")]
     WorkerStopped,
+    #[error("the link was not approved in time")]
+    LinkExpired,
     #[error("Steam integration is available on Windows only")]
     WindowsOnly,
 }
@@ -24,10 +26,12 @@ pub enum CoreError {
 pub type CoreResult<T> = Result<T, CoreError>;
 
 pub enum Command {
-    Pair {
-        code: String,
+    /// Starts linking this computer to the active Steam account: the app opens the browser,
+    /// the owner approves there, and the worker picks the result up by polling.
+    Link {
         server: String,
     },
+    CancelLink,
     Start,
     Stop,
     Inspect {
@@ -41,9 +45,14 @@ pub enum Command {
 pub enum Status {
     Idle,
     SignedOut,
-    NeedsPairing { steam_id64: String },
-    Watching { steam_id64: String },
-    Pairing,
+    NeedsPairing {
+        steam_id64: String,
+    },
+    Watching {
+        steam_id64: String,
+    },
+    /// Waiting for the owner to approve the link in the browser.
+    Linking,
     Stopped,
 }
 
@@ -66,6 +75,7 @@ pub struct Roster {
 pub enum Event {
     Status(Status),
     PairComplete { steam_id64: String },
+    OpenUrl(String),
     Roster(Roster),
     Error(String),
 }

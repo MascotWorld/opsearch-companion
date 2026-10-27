@@ -54,42 +54,55 @@ impl ApiClient {
         Ok(Self { http })
     }
 
-    pub fn pair(
+    /// Asks the server to link this computer to the Steam account read locally. The returned
+    /// token stays inert until the account's owner approves the request in the browser.
+    pub fn request_link(
         &self,
         server: &str,
-        code: &str,
         steam_id64: &str,
         device_name: &str,
-    ) -> CoreResult<PairResponse> {
+    ) -> CoreResult<LinkRequest> {
         let origin = validate_server(server)?;
-        if code.len() != 12 || !code.is_ascii() || !valid_steam_id(steam_id64) {
-            return Err(CoreError::InvalidInput(
-                "pairing code or Steam account is invalid".into(),
-            ));
+        if !valid_steam_id(steam_id64) {
+            return Err(CoreError::InvalidInput("Steam account is invalid".into()));
         }
-        let request = PairRequest {
-            code,
+        let request = LinkRequestBody {
             steamid64: steam_id64,
             device_name,
             client_version: env!("CARGO_PKG_VERSION"),
         };
         let response = self
             .http
-            .post(format!("{origin}/api/cs2/companion/pair"))
+            .post(format!("{origin}/api/cs2/companion/links"))
             .json(&request)
             .send()
             .map_err(|_| CoreError::Network)?;
         let body = successful_body(response)?;
-        let result: PairResponse = serde_json::from_slice(&body).map_err(|_| {
-            CoreError::InvalidInput("server returned an invalid pairing response".into())
+        let result: LinkRequest = serde_json::from_slice(&body).map_err(|_| {
+            CoreError::InvalidInput("server returned an invalid link response".into())
         })?;
-        if result.token.is_empty() || result.device_id.is_empty() || result.steamid64 != steam_id64
-        {
+        if result.token.is_empty() || !valid_link_id(&result.link_id) {
             return Err(CoreError::InvalidInput(
-                "server returned invalid device credentials".into(),
+                "server returned an invalid link response".into(),
             ));
         }
         Ok(result)
+    }
+
+    pub fn link_status(&self, server: &str, link_id: &str, token: &str) -> CoreResult<LinkStatus> {
+        let origin = validate_server(server)?;
+        if !valid_link_id(link_id) {
+            return Err(CoreError::InvalidInput("link id is invalid".into()));
+        }
+        let response = self
+            .http
+            .get(format!("{origin}/api/cs2/companion/links/{link_id}/status"))
+            .bearer_auth(token)
+            .send()
+            .map_err(|_| CoreError::Network)?;
+        let body = successful_body(response)?;
+        serde_json::from_slice(&body)
+            .map_err(|_| CoreError::InvalidInput("server returned an invalid link status".into()))
     }
 
     pub fn send_roster(
@@ -136,18 +149,27 @@ impl ApiClient {
 }
 
 #[derive(Serialize)]
-struct PairRequest<'a> {
-    code: &'a str,
+struct LinkRequestBody<'a> {
     steamid64: &'a str,
     device_name: &'a str,
     client_version: &'a str,
 }
 
 #[derive(Deserialize)]
-pub(crate) struct PairResponse {
-    pub device_id: String,
+pub(crate) struct LinkRequest {
+    pub link_id: String,
     pub token: String,
-    pub steamid64: String,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct LinkStatus {
+    pub status: String,
+    pub device_id: Option<String>,
+}
+
+/// Link ids are server UUIDs; anything else must not reach a URL path.
+fn valid_link_id(id: &str) -> bool {
+    id.len() == 36 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
 #[derive(Serialize)]

@@ -14,6 +14,18 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const RETRY_START: Duration = Duration::from_secs(5);
 const RETRY_MAX: Duration = Duration::from_secs(60);
+const LINK_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const LINK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// A link request waiting for the owner to approve it in the browser.
+struct PendingLink {
+    origin: String,
+    steam_id64: String,
+    link_id: String,
+    token: String,
+    deadline: Instant,
+    next_check: Instant,
+}
 
 pub struct CoreHandle {
     commands: Sender<Command>,
@@ -98,6 +110,7 @@ fn worker_loop(commands: Receiver<Command>, events: Sender<Event>) {
     };
     let mut state = MonitorState::default();
     let mut next_poll = Instant::now();
+    let mut pending_link: Option<PendingLink> = None;
 
     loop {
         let timeout = next_poll
@@ -113,17 +126,20 @@ fn worker_loop(commands: Receiver<Command>, events: Sender<Event>) {
                 state = MonitorState::default();
                 let _ = events.send(Event::Status(Status::Stopped));
             }
-            Ok(Command::Pair { code, server }) => {
-                let _ = events.send(Event::Status(Status::Pairing));
-                match pair_device(&api_client, &mut config, &code, &server) {
-                    Ok(steam_id64) => {
-                        let _ = events.send(Event::PairComplete { steam_id64 });
-                        if state.running {
-                            next_poll = Instant::now();
-                        }
-                    }
-                    Err(error) => emit_error(&events, error),
+            Ok(Command::Link { server }) => match request_link(&api_client, &server) {
+                Ok(link) => {
+                    let _ = events.send(Event::Status(Status::Linking));
+                    let _ = events.send(Event::OpenUrl(format!(
+                        "{}/companion/link/{}",
+                        link.origin, link.link_id
+                    )));
+                    pending_link = Some(link);
                 }
+                Err(error) => emit_error(&events, error),
+            },
+            Ok(Command::CancelLink) => {
+                pending_link = None;
+                next_poll = Instant::now();
             }
             Ok(Command::Inspect { path, owner }) => {
                 let result = owner
@@ -145,7 +161,27 @@ fn worker_loop(commands: Receiver<Command>, events: Sender<Event>) {
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
 
-        if state.running && Instant::now() >= next_poll {
+        if let Some(link) = pending_link.as_mut()
+            && Instant::now() >= link.next_check
+        {
+            link.next_check = Instant::now() + LINK_POLL_INTERVAL;
+            match check_link(&api_client, &mut config, link) {
+                Ok(true) => {
+                    let steam_id64 = link.steam_id64.clone();
+                    pending_link = None;
+                    let _ = events.send(Event::PairComplete { steam_id64 });
+                    next_poll = Instant::now();
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    pending_link = None;
+                    emit_error(&events, error);
+                    next_poll = Instant::now();
+                }
+            }
+        }
+
+        if state.running && pending_link.is_none() && Instant::now() >= next_poll {
             poll_once(&api_client, &mut config, &events, &mut state);
             next_poll = Instant::now() + POLL_INTERVAL;
         }
@@ -153,31 +189,61 @@ fn worker_loop(commands: Receiver<Command>, events: Sender<Event>) {
     let _ = events.send(Event::Status(Status::Stopped));
 }
 
-fn pair_device(
-    api: &ApiClient,
-    store: &mut Option<ConfigStore>,
-    code: &str,
-    server: &str,
-) -> CoreResult<String> {
+fn request_link(api: &ApiClient, server: &str) -> CoreResult<PendingLink> {
     let origin = api::validate_server(server)?;
     let account = steam::active_account()?;
     let device_name = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "Windows PC".into());
-    let response = api.pair(&origin, code, &account.steam_id64, &device_name)?;
-    let config = if let Some(config) = store.as_mut() {
-        config
-    } else {
-        *store = Some(ConfigStore::load_default()?);
-        store.as_mut().expect("config was just initialized")
-    };
-    config.store_device(
-        &account.steam_id64,
-        response.device_id,
-        response.token,
+    let response = api.request_link(&origin, &account.steam_id64, &device_name)?;
+    Ok(PendingLink {
         origin,
-    )?;
-    Ok(account.steam_id64)
+        steam_id64: account.steam_id64,
+        link_id: response.link_id,
+        token: response.token,
+        deadline: Instant::now() + LINK_TIMEOUT,
+        next_check: Instant::now() + LINK_POLL_INTERVAL,
+    })
+}
+
+/// Returns true once the owner has approved the link and the device is stored.
+fn check_link(
+    api: &ApiClient,
+    store: &mut Option<ConfigStore>,
+    link: &PendingLink,
+) -> CoreResult<bool> {
+    if Instant::now() >= link.deadline {
+        return Err(CoreError::LinkExpired);
+    }
+    let status = match api.link_status(&link.origin, &link.link_id, &link.token) {
+        Ok(status) => status,
+        // A dropped connection while the user is in the browser is not fatal; try again.
+        Err(CoreError::Network) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    match status.status.as_str() {
+        "pending" => Ok(false),
+        "expired" => Err(CoreError::LinkExpired),
+        "approved" => {
+            let device_id = status.device_id.ok_or_else(|| {
+                CoreError::InvalidInput("server approved the link without a device".into())
+            })?;
+            let config = if let Some(config) = store.as_mut() {
+                config
+            } else {
+                *store = Some(ConfigStore::load_default()?);
+                store.as_mut().expect("config was just initialized")
+            };
+            config.store_device(
+                &link.steam_id64,
+                device_id,
+                link.token.clone(),
+                link.origin.clone(),
+            )?;
+            Ok(true)
+        }
+        _ => Err(CoreError::InvalidInput("unknown link status".into())),
+    }
 }
 
 fn poll_once(
