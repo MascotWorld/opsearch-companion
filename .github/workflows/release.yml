@@ -1,27 +1,152 @@
 name: Release
 
+# Two ways to cut a release:
+#   - Actions → Release → Run workflow, pick patch/minor/major. The workflow bumps the version
+#     in Cargo.toml, commits it, tags it and publishes the build.
+#   - Push a tag yourself (git tag v1.2.3 && git push --tags). The tag must match the version
+#     already in Cargo.toml.
+# Asset names stay the same in every release, so
+# https://github.com/MascotWorld/opsearch-companion/releases/latest/download/opsearch-companion-windows-x64.exe
+# always points at the newest build, and the app's update check reads /releases/latest.
 on:
   push:
     tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Which part of the version to raise
+        type: choice
+        options: [patch, minor, major]
+        default: patch
 
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
-  packages:
+  version:
+    # v0.1.x is the historical Go prerelease; only Rust releases are automated here.
+    if: ${{ !startsWith(github.ref, 'refs/tags/v0.1.') }}
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out the release version
+        id: version
+        shell: bash
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+          current=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            if [[ "$version" != "$current" ]]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $current"
+              exit 1
+            fi
+          else
+            IFS=. read -r major minor patch <<< "$current"
+            case "$BUMP" in
+              major) version="$((major + 1)).0.0" ;;
+              minor) version="$major.$((minor + 1)).0" ;;
+              *)     version="$major.$minor.$((patch + 1))" ;;
+            esac
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "Release version: $version (Cargo.toml had $current)"
+
+      - name: Commit and tag the bumped version
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::Tag v$VERSION already exists"
+            exit 1
+          fi
+          # Only the package's own entries: the first version line in Cargo.toml, and the line
+          # after `name = "opsearch-companion"` in Cargo.lock.
+          perl -0pi -e 's/^version = ".*?"$/version = "$ENV{VERSION}"/m' Cargo.toml
+          perl -0pi -e 's/^(name = "opsearch-companion"\n)version = ".*?"$/$1version = "$ENV{VERSION}"/m' Cargo.lock
+          git diff --stat
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore: release v$VERSION"
+          git tag -a "v$VERSION" -m "v$VERSION"
+          git push origin "HEAD:${GITHUB_REF_NAME}" "v$VERSION"
+
+  windows-x64:
+    needs: version
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v6
         with:
-          go-version-file: go.mod
-          cache: true
-      - name: Test and package x64 and ARM64
-        shell: pwsh
-        run: .\scripts\package.ps1
-      - name: Create release with checksummed downloads
-        env:
-          GH_TOKEN: ${{ github.token }}
+          ref: ${{ needs.version.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Check the built version matches the tag
         shell: pwsh
         run: |
-          gh release create $env:GITHUB_REF_NAME dist/*.zip dist/*.sha256 --generate-notes
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"$' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ("v$version" -ne "${{ needs.version.outputs.tag }}") { throw "Cargo.toml has $version, expected ${{ needs.version.outputs.tag }}" }
+
+      - name: Check formatting and Clippy
+        run: |
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --locked --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        shell: pwsh
+
+      - name: Package portable Windows executable
+        shell: pwsh
+        run: .\scripts\package.ps1
+
+      - name: Verify no external runtime DLLs are required
+        shell: pwsh
+        run: |
+          $exe = "dist\opsearch-companion-windows-x64.exe"
+          $dumpbin = (Get-Command dumpbin -CommandType Application -ErrorAction Stop).Source
+          Write-Host "Inspecting PE imports with $dumpbin"
+          $imports = (& $dumpbin /nologo /dependents $exe 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin could not inspect the executable`n$imports" }
+          Write-Host $imports
+          if ($imports -match '(?i)VCRUNTIME|MSVCP|WebView2|libssl|libcrypto') {
+            throw "Release executable imports an external runtime that must not be required by end users."
+          }
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        shell: pwsh
+        run: |
+          gh release create $env:TAG `
+            dist/opsearch-companion-windows-x64.exe `
+            dist/opsearch-companion-windows-x64.exe.sha256 `
+            dist/opsearch-companion-windows-x64.zip `
+            dist/opsearch-companion-windows-x64.zip.sha256 `
+            --title "OPSearch Companion $env:TAG" `
+            --generate-notes `
+            --latest `
+            --verify-tag

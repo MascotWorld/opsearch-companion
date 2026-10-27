@@ -8,22 +8,47 @@ permissions:
   contents: read
 
 jobs:
-  test-and-cross-build:
+  windows-x64:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v6
+
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
-          go-version-file: go.mod
-          cache: true
-      - name: Run tests
-        run: go test ./...
-      - name: Cross-build release architectures
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Rust tests
+        run: cargo test --locked
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build portable Windows x64 executable
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          $env:GOOS = "windows"
-          foreach ($arch in @("amd64", "arm64")) {
-            $env:GOARCH = $arch
-            go build -buildvcs=false -trimpath -o "dist/opsearch-companion-windows-$arch.exe" ./cmd/opsearch-companion
+          cargo build --locked --release --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check executable runtime dependencies
+        shell: pwsh
+        run: |
+          $exe = "target\x86_64-pc-windows-msvc\release\opsearch-companion.exe"
+          if (-not (Test-Path $exe)) { throw "Missing expected executable: $exe" }
+          $dumpbin = (Get-Command dumpbin -CommandType Application -ErrorAction Stop).Source
+          Write-Host "Inspecting PE imports with $dumpbin"
+          $imports = (& $dumpbin /nologo /dependents $exe 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin could not inspect the executable`n$imports" }
+          Write-Host $imports
+          if ($imports -match '(?i)VCRUNTIME|MSVCP|WebView2|libssl|libcrypto') {
+            throw "Executable imports an external runtime that must not be required by end users."
           }

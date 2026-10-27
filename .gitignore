@@ -1,5 +1,6 @@
 /dist/
 /artifacts/
+/target/
 *.exe
 config.json
 snapshots.jsonl
