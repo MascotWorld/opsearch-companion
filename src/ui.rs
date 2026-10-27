@@ -1,21 +1,25 @@
+use crate::tray::{self, Tray};
 use chrono::{Local, TimeZone};
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, CursorIcon, FontFamily, FontId, Layout, Pos2, Rect,
     RichText, Sense, Stroke, StrokeKind, Vec2,
 };
 use opsearch_companion::{
-    CURRENT_VERSION, Command, CoreHandle, DEFAULT_SERVER, Event, Player, Roster, Status,
-    UpdateChecker, UpdateInfo,
+    BACKGROUND_FLAG, CURRENT_VERSION, Command, CoreHandle, DEFAULT_SERVER, Event, Player,
+    ProfileLoader, Roster, Settings, Status, SteamProfile, UpdateChecker, UpdateInfo, autostart,
+    open_in_browser,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 /// The window is fixed: everything fits without scrolling.
-pub const WINDOW_SIZE: [f32; 2] = [400.0, 600.0];
+pub const WINDOW_SIZE: [f32; 2] = [400.0, 510.0];
 const TITLE_BAR: f32 = 46.0;
 const PAD: f32 = 22.0;
 const MAX_ROWS: usize = 10;
-const ROW: f32 = 30.0;
+const ROW: f32 = 28.0;
+const AVATAR: f32 = 22.0;
 
 // The opsearch.pro palette, flattened to opaque colours.
 const BG: Color32 = Color32::from_rgb(11, 13, 17);
@@ -42,6 +46,23 @@ pub struct CompanionApp {
     error: Option<String>,
     updates: Option<UpdateChecker>,
     update: Option<UpdateInfo>,
+    profiles: Option<ProfileLoader>,
+    /// Every SteamID asked for; `None` until Steam answers.
+    cards: HashMap<String, Option<PlayerCard>>,
+    window: Option<tray::Window>,
+    tray: Option<Tray>,
+    settings: Settings,
+    autostart: bool,
+    show_settings: bool,
+    settings_error: Option<String>,
+    /// Launched by autostart: get out of the way on the first frame.
+    start_hidden: bool,
+}
+
+/// A player's Steam name and avatar, ready to draw.
+struct PlayerCard {
+    name: Option<String>,
+    avatar: Option<egui::TextureHandle>,
 }
 
 /// What the middle of the window says, derived from the worker's status.
@@ -77,7 +98,80 @@ impl CompanionApp {
             error,
             updates: Some(UpdateChecker::spawn()),
             update: None,
+            profiles: Some(ProfileLoader::spawn()),
+            cards: HashMap::new(),
+            window: None,
+            tray: None,
+            settings: Settings::load(),
+            autostart: autostart::enabled(),
+            show_settings: false,
+            settings_error: None,
+            start_hidden: std::env::args().any(|arg| arg == BACKGROUND_FLAG),
         }
+        .with_window(tray::Window::new(cc))
+    }
+
+    fn with_window(mut self, window: tray::Window) -> Self {
+        if self.settings.tray {
+            self.tray = Tray::new(&window, &window_icon());
+        }
+        self.window = Some(window);
+        self
+    }
+
+    /// Closing and minimising hide to the tray while it is on.
+    fn put_away(&self, ctx: &egui::Context, close: bool) {
+        match (&self.tray, &self.window) {
+            (Some(_), Some(window)) => window.hide(),
+            _ if close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            _ => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+        }
+    }
+
+    fn set_tray(&mut self, on: bool) {
+        let previous = self.settings.clone();
+        self.settings.tray = on;
+        self.tray = match (&self.window, on) {
+            (Some(window), true) => Tray::new(window, &window_icon()),
+            _ => None,
+        };
+        if on && self.tray.is_none() {
+            self.settings = previous;
+            self.settings_error = Some("Не удалось добавить значок в трей".into());
+        } else if self.settings.save().is_err() {
+            self.settings_error = Some("Не удалось сохранить настройки".into());
+        }
+    }
+
+    fn set_autostart(&mut self, on: bool) {
+        match autostart::set(on) {
+            Ok(()) => self.autostart = autostart::enabled(),
+            Err(_) => self.settings_error = Some("Windows не дала изменить автозапуск".into()),
+        }
+    }
+
+    /// Asks for the name and avatar of the owner and everyone in the lobby, once each.
+    fn load_cards(&mut self, ctx: &egui::Context) {
+        let Some(loader) = &self.profiles else { return };
+        for profile in loader.poll() {
+            let card = card_from(ctx, profile.clone());
+            self.cards.insert(profile.steamid64, Some(card));
+        }
+        let wanted = self.owner_id.iter().chain(
+            self.roster
+                .iter()
+                .flat_map(|roster| roster.players.iter().map(|p| &p.steamid64)),
+        );
+        for id in wanted {
+            if !self.cards.contains_key(id) {
+                self.cards.insert(id.clone(), None);
+                loader.request(id);
+            }
+        }
+    }
+
+    fn card(&self, id: &str) -> Option<&PlayerCard> {
+        self.cards.get(id).and_then(Option::as_ref)
     }
 
     fn receive_events(&mut self, ctx: &egui::Context) {
@@ -106,7 +200,7 @@ impl CompanionApp {
                     }
                 }
                 Event::OpenUrl(url) => {
-                    ctx.open_url(egui::OpenUrl::new_tab(url.clone()));
+                    open_in_browser(url.clone());
                     self.link_url = Some(url);
                     self.status = Status::Linking;
                 }
@@ -138,6 +232,7 @@ impl CompanionApp {
         if let Some(update) = self.updates.as_ref().and_then(UpdateChecker::poll) {
             self.update = Some(update);
         }
+        self.load_cards(ctx);
         ctx.request_repaint_after(Duration::from_millis(100));
     }
 
@@ -150,11 +245,7 @@ impl CompanionApp {
     }
 
     fn headline(&self) -> Headline {
-        let account = self
-            .owner_id
-            .as_deref()
-            .map(|id| format!("Steam · {}", short_id(id)))
-            .unwrap_or_default();
+        let account = String::new();
         match &self.status {
             Status::Idle => Headline {
                 color: FAINT,
@@ -200,7 +291,7 @@ impl CompanionApp {
         }
     }
 
-    fn title_bar(&self, ui: &mut egui::Ui) {
+    fn title_bar(&mut self, ui: &mut egui::Ui) {
         let rect = Rect::from_min_size(
             ui.max_rect().min,
             Vec2::new(ui.max_rect().width(), TITLE_BAR),
@@ -237,30 +328,46 @@ impl CompanionApp {
             Vec2::splat(30.0),
         );
         let minimize = close.translate(Vec2::new(-34.0, 0.0));
+        let gear = minimize.translate(Vec2::new(-34.0, 0.0));
         if window_button(ui, close, "close", RED) {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            self.put_away(ui.ctx(), true);
         }
         if window_button(ui, minimize, "minimize", TEXT) {
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            self.put_away(ui.ctx(), false);
+        }
+        if window_button(ui, gear, "settings", TEXT) {
+            self.show_settings = !self.show_settings;
+            self.settings_error = None;
         }
     }
 
     fn status_block(&mut self, ui: &mut egui::Ui) {
         let head = self.headline();
-        ui.add_space(26.0);
-        ui.vertical_centered(|ui| {
+        ui.add_space(14.0);
+        // One row: the orb, then what is happening and whose account it is.
+        ui.horizontal(|ui| {
             status_orb(ui, head.color, head.pulse);
-            ui.add_space(16.0);
-            ui.label(
-                RichText::new(head.title)
-                    .font(FontId::new(20.0, display_font()))
-                    .color(TEXT),
-            );
-            ui.add_space(4.0);
-            ui.label(RichText::new(&head.detail).size(13.0).color(MUTED));
+            ui.add_space(10.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                ui.label(
+                    RichText::new(head.title)
+                        .font(FontId::new(18.0, display_font()))
+                        .color(TEXT),
+                );
+                if !head.detail.is_empty() {
+                    ui.label(RichText::new(&head.detail).size(12.5).color(MUTED));
+                }
+                if matches!(
+                    self.status,
+                    Status::NeedsPairing { .. } | Status::Watching { .. } | Status::Stopped
+                ) && let Some(id) = &self.owner_id
+                {
+                    owner_chip(ui, id, self.card(id));
+                }
+            });
         });
-        ui.add_space(20.0);
+        ui.add_space(18.0);
 
         match &self.status {
             Status::NeedsPairing { .. } => {
@@ -278,7 +385,7 @@ impl CompanionApp {
                     if secondary_button(&mut cols[0], "Открыть снова")
                         && let Some(url) = &self.link_url
                     {
-                        cols[0].ctx().open_url(egui::OpenUrl::new_tab(url.clone()));
+                        open_in_browser(url.clone());
                     }
                     if secondary_button(&mut cols[1], "Отмена") {
                         let _ = self.send(Command::CancelLink);
@@ -315,7 +422,7 @@ impl CompanionApp {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if let Some(roster) = &self.roster {
                     ui.label(
-                        RichText::new(relative_time(roster.observed_at))
+                        RichText::new(format!("сыграли · {}", clock(roster.owner_playtime)))
                             .size(11.0)
                             .color(FAINT),
                     );
@@ -360,7 +467,7 @@ impl CompanionApp {
             others.len()
         };
         for player in others.iter().take(shown) {
-            player_row(&mut ui, player);
+            player_row(&mut ui, player, self.card(&player.steamid64));
         }
         if others.len() > shown
             && text_link(
@@ -369,8 +476,57 @@ impl CompanionApp {
                 MUTED,
             )
         {
-            ui.ctx()
-                .open_url(egui::OpenUrl::new_tab(DEFAULT_SERVER.to_owned()));
+            open_in_browser(DEFAULT_SERVER.to_owned());
+        }
+    }
+
+    fn settings_view(&mut self, ui: &mut egui::Ui, height: f32) {
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
+        let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+        ui.add_space(18.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Настройки")
+                    .font(FontId::new(20.0, display_font()))
+                    .color(TEXT),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if text_link(ui, "Готово", MINT) {
+                    self.show_settings = false;
+                }
+            });
+        });
+        ui.add_space(18.0);
+        ui.spacing_mut().item_spacing.y = 8.0;
+        let autostart_supported = autostart::supported();
+        if toggle_row(
+            &mut ui,
+            "Запускать вместе с Windows",
+            if autostart_supported {
+                "Откроется в фоне при входе в систему"
+            } else {
+                "Доступно только в Windows"
+            },
+            self.autostart,
+            autostart_supported,
+        ) {
+            self.settings_error = None;
+            self.set_autostart(!self.autostart);
+        }
+        if toggle_row(
+            &mut ui,
+            "Сворачивать в трей",
+            "Закрыть и свернуть прячут окно к часам",
+            self.settings.tray,
+            true,
+        ) {
+            self.settings_error = None;
+            self.set_tray(!self.settings.tray);
+        }
+        if let Some(error) = &self.settings_error {
+            ui.add_space(6.0);
+            ui.label(RichText::new(error).size(12.0).color(RED));
         }
     }
 
@@ -384,8 +540,7 @@ impl CompanionApp {
             if let Some(update) = &self.update
                 && text_link(ui, &format!("Обновить до {}", update.version), MINT)
             {
-                ui.ctx()
-                    .open_url(egui::OpenUrl::new_tab(update.url.clone()));
+                open_in_browser(update.url.clone());
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let toggle = match self.status {
@@ -402,14 +557,10 @@ impl CompanionApp {
                     && let Some(id) = self.owner_id.clone()
                     && text_link(ui, "Профиль", MUTED)
                 {
-                    ui.ctx().open_url(egui::OpenUrl::new_tab(format!(
-                        "{DEFAULT_SERVER}/profiles/{id}"
-                    )));
+                    open_in_browser(format!("{DEFAULT_SERVER}/profiles/{id}"));
                 }
                 if text_link(ui, "Сайт", MUTED) {
-                    ui.ctx().open_url(egui::OpenUrl::new_tab(format!(
-                        "{DEFAULT_SERVER}/companion"
-                    )));
+                    open_in_browser(format!("{DEFAULT_SERVER}/companion"));
                 }
             });
         });
@@ -422,7 +573,19 @@ impl eframe::App for CompanionApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.receive_events(ui.ctx());
+        let ctx = ui.ctx().clone();
+        self.receive_events(&ctx);
+        if std::mem::take(&mut self.start_hidden) {
+            self.put_away(&ctx, false);
+        }
+        // Alt+F4 and the taskbar's close hide to the tray too, unless the tray menu said quit.
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.tray.is_some()
+            && !tray::QUITTING.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.put_away(&ctx, false);
+        }
         self.draw(ui);
     }
 }
@@ -445,10 +608,15 @@ impl CompanionApp {
                         .max_rect(body)
                         .layout(Layout::top_down(Align::Min)),
                 );
-                self.status_block(&mut body_ui);
-                body_ui.add_space(18.0);
-                let lobby_height = body_ui.available_height() - 30.0;
-                self.lobby(&mut body_ui, lobby_height.max(0.0));
+                if self.show_settings {
+                    let height = body_ui.available_height() - 30.0;
+                    self.settings_view(&mut body_ui, height.max(0.0));
+                } else {
+                    self.status_block(&mut body_ui);
+                    body_ui.add_space(10.0);
+                    let lobby_height = body_ui.available_height() - 30.0;
+                    self.lobby(&mut body_ui, lobby_height.max(0.0));
+                }
                 self.footer(&mut body_ui);
             });
     }
@@ -507,7 +675,7 @@ pub fn window_icon() -> Arc<egui::IconData> {
     )
 }
 
-/// A soft light from the top and a hairline border, so the frameless window has an edge.
+/// A soft light from the top. Windows draws the frameless window's own edge.
 fn paint_backdrop(ui: &egui::Ui, rect: Rect) {
     let painter = ui.painter();
     let mut mesh = egui::Mesh::default();
@@ -519,12 +687,6 @@ fn paint_backdrop(ui: &egui::Ui, rect: Rect) {
     mesh.add_triangle(0, 1, 2);
     mesh.add_triangle(1, 2, 3);
     painter.add(mesh);
-    painter.rect_stroke(
-        rect.shrink(0.5),
-        CornerRadius::ZERO,
-        Stroke::new(1.0, BORDER),
-        StrokeKind::Inside,
-    );
 }
 
 fn window_button(ui: &mut egui::Ui, rect: Rect, kind: &str, hover_color: Color32) -> bool {
@@ -542,7 +704,15 @@ fn window_button(ui: &mut egui::Ui, rect: Rect, kind: &str, hover_color: Color32
     };
     let stroke = Stroke::new(1.4, color);
     let c = rect.center();
-    if kind == "close" {
+    if kind == "settings" {
+        painter.circle_stroke(c, 3.0, stroke);
+        for i in 0..6 {
+            let angle = i as f32 * std::f32::consts::TAU / 6.0;
+            let dir = Vec2::angled(angle);
+            painter.line_segment([c + dir * 5.0, c + dir * 7.0], Stroke::new(2.0, color));
+        }
+        painter.circle_stroke(c, 5.5, Stroke::new(1.2, color));
+    } else if kind == "close" {
         let d = 5.0;
         painter.line_segment([c + Vec2::new(-d, -d), c + Vec2::new(d, d)], stroke);
         painter.line_segment([c + Vec2::new(-d, d), c + Vec2::new(d, -d)], stroke);
@@ -553,17 +723,17 @@ fn window_button(ui: &mut egui::Ui, rect: Rect, kind: &str, hover_color: Color32
 }
 
 fn status_orb(ui: &mut egui::Ui, color: Color32, pulse: bool) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(64.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(52.0), Sense::hover());
     let painter = ui.painter();
     let c = rect.center();
     if pulse {
         let t = (ui.input(|i| i.time) % 2.0) as f32 / 2.0;
-        let radius = 14.0 + t * 18.0;
+        let radius = 12.0 + t * 14.0;
         painter.circle_filled(c, radius, color.gamma_multiply(0.35 * (1.0 - t)));
     }
-    painter.circle_filled(c, 26.0, color.gamma_multiply(0.08));
-    painter.circle_stroke(c, 26.0, Stroke::new(1.0, color.gamma_multiply(0.35)));
-    painter.circle_filled(c, 8.0, color);
+    painter.circle_filled(c, 21.0, color.gamma_multiply(0.08));
+    painter.circle_stroke(c, 21.0, Stroke::new(1.0, color.gamma_multiply(0.35)));
+    painter.circle_filled(c, 7.0, color);
 }
 
 fn primary_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> bool {
@@ -625,6 +795,55 @@ fn secondary_button(ui: &mut egui::Ui, label: &str) -> bool {
     response.clicked()
 }
 
+/// A setting: the whole row toggles it.
+fn toggle_row(ui: &mut egui::Ui, title: &str, detail: &str, on: bool, enabled: bool) -> bool {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 60.0), Sense::click());
+    let response = if enabled {
+        response.on_hover_cursor(CursorIcon::PointingHand)
+    } else {
+        response
+    };
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        CornerRadius::same(12),
+        if enabled && response.hovered() {
+            SURFACE_HOVER
+        } else {
+            SURFACE
+        },
+    );
+    painter.text(
+        Pos2::new(rect.left() + 14.0, rect.center().y - 9.0),
+        Align2::LEFT_CENTER,
+        title,
+        FontId::proportional(13.5),
+        if enabled { TEXT } else { MUTED },
+    );
+    painter.text(
+        Pos2::new(rect.left() + 14.0, rect.center().y + 10.0),
+        Align2::LEFT_CENTER,
+        detail,
+        FontId::proportional(11.5),
+        FAINT,
+    );
+    let track = Rect::from_center_size(
+        Pos2::new(rect.right() - 14.0 - 18.0, rect.center().y),
+        Vec2::new(36.0, 20.0),
+    );
+    let t = ui.ctx().animate_bool(response.id, on);
+    let fill = if on { MINT } else { BORDER };
+    painter.rect_filled(track, CornerRadius::same(10), fill);
+    let knob_x = egui::lerp(track.left() + 10.0..=track.right() - 10.0, t);
+    painter.circle_filled(
+        Pos2::new(knob_x, track.center().y),
+        7.0,
+        if on { ON_PRIMARY } else { MUTED },
+    );
+    enabled && response.clicked()
+}
+
 fn text_link(ui: &mut egui::Ui, label: &str, color: Color32) -> bool {
     let response = ui
         .add(egui::Label::new(RichText::new(label).size(11.0).color(color)).sense(Sense::click()))
@@ -643,35 +862,124 @@ fn text_link(ui: &mut egui::Ui, label: &str, color: Color32) -> bool {
 }
 
 /// One lobby player: the whole row opens their OPSearch profile.
-fn player_row(ui: &mut egui::Ui, player: &Player) {
+fn player_row(ui: &mut egui::Ui, player: &Player, card: Option<&PlayerCard>) {
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW), Sense::click());
-    let response = response
-        .on_hover_cursor(CursorIcon::PointingHand)
-        .on_hover_text("Открыть профиль на OPSearch");
-    let painter = ui.painter();
+    let response = response.on_hover_cursor(CursorIcon::PointingHand);
     if response.hovered() {
-        painter.rect_filled(rect, CornerRadius::same(8), SURFACE_HOVER);
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(8), SURFACE_HOVER);
     }
-    painter.text(
-        Pos2::new(rect.left() + 10.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        &player.steamid64,
-        FontId::monospace(12.0),
-        if response.hovered() { TEXT } else { MUTED },
+    let avatar = Rect::from_center_size(
+        Pos2::new(rect.left() + 8.0 + AVATAR / 2.0, rect.center().y),
+        Vec2::splat(AVATAR),
     );
-    painter.text(
+    paint_avatar(ui, avatar, card);
+    let time = clock(player.playtime);
+    let time_width = 44.0;
+    let name_rect = Rect::from_min_max(
+        Pos2::new(avatar.right() + 10.0, rect.top()),
+        Pos2::new(rect.right() - 10.0 - time_width, rect.bottom()),
+    );
+    let (text, font) = match card.and_then(|c| c.name.as_deref()) {
+        Some(name) => (name.to_owned(), FontId::proportional(13.0)),
+        None => (player.steamid64.clone(), FontId::monospace(12.0)),
+    };
+    let color = if response.hovered() {
+        TEXT
+    } else {
+        Color32::from_rgb(205, 210, 218)
+    };
+    let galley = elide(ui, &text, name_rect.width(), font, color);
+    ui.painter().galley(
+        Pos2::new(name_rect.left(), rect.center().y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+    ui.painter().text(
         Pos2::new(rect.right() - 10.0, rect.center().y),
         Align2::RIGHT_CENTER,
-        if response.hovered() { "↗" } else { "" },
-        FontId::proportional(12.0),
-        MINT,
+        time,
+        FontId::proportional(11.0),
+        FAINT,
     );
     if response.clicked() {
-        ui.ctx().open_url(egui::OpenUrl::new_tab(format!(
-            "{DEFAULT_SERVER}/profiles/{}",
-            player.steamid64
-        )));
+        open_in_browser(format!("{DEFAULT_SERVER}/profiles/{}", player.steamid64));
+    }
+}
+
+/// The signed-in account under the status: avatar and name, opening the OPSearch profile.
+fn owner_chip(ui: &mut egui::Ui, id: &str, card: Option<&PlayerCard>) {
+    let name = card
+        .and_then(|c| c.name.clone())
+        .unwrap_or_else(|| short_id(id));
+    let font = FontId::proportional(13.0);
+    let galley = ui.painter().layout(name, font, MUTED, 220.0);
+    let size = Vec2::new(6.0 + AVATAR + 8.0 + galley.size().x + 12.0, AVATAR + 8.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let response = response.on_hover_cursor(CursorIcon::PointingHand);
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        CornerRadius::same(255),
+        if response.hovered() {
+            SURFACE_HOVER
+        } else {
+            SURFACE
+        },
+    );
+    let avatar = Rect::from_center_size(
+        Pos2::new(rect.left() + 4.0 + AVATAR / 2.0, rect.center().y),
+        Vec2::splat(AVATAR),
+    );
+    paint_avatar(ui, avatar, card);
+    let color = if response.hovered() { TEXT } else { MUTED };
+    ui.painter().galley(
+        Pos2::new(
+            avatar.right() + 8.0,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        color,
+    );
+    if response.clicked() {
+        open_in_browser(format!("{DEFAULT_SERVER}/profiles/{id}"));
+    }
+}
+
+fn paint_avatar(ui: &egui::Ui, rect: Rect, card: Option<&PlayerCard>) {
+    match card.and_then(|c| c.avatar.as_ref()) {
+        Some(texture) => {
+            egui::Image::new(egui::load::SizedTexture::new(texture.id(), rect.size()))
+                .corner_radius(CornerRadius::same(6))
+                .paint_at(ui, rect);
+        }
+        None => {
+            ui.painter()
+                .rect_filled(rect, CornerRadius::same(6), Color32::from_rgb(40, 44, 52));
+        }
+    }
+}
+
+/// Cuts a single line of text to fit `width`, ending it with an ellipsis.
+fn elide(ui: &egui::Ui, text: &str, width: f32, font: FontId, color: Color32) -> Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(width);
+    ui.painter().layout_job(job)
+}
+
+fn card_from(ctx: &egui::Context, profile: SteamProfile) -> PlayerCard {
+    let side = SteamProfile::AVATAR_SIZE as usize;
+    let avatar = profile.avatar.map(|pixels| {
+        ctx.load_texture(
+            format!("avatar-{}", profile.steamid64),
+            egui::ColorImage::from_rgba_unmultiplied([side, side], &pixels),
+            egui::TextureOptions::LINEAR,
+        )
+    });
+    PlayerCard {
+        name: profile.name,
+        avatar,
     }
 }
 
@@ -683,23 +991,15 @@ fn short_id(id: &str) -> String {
     }
 }
 
-fn relative_time(time: SystemTime) -> String {
-    let elapsed = time.elapsed().unwrap_or_default();
-    if elapsed < Duration::from_secs(60) {
-        "только что".into()
-    } else if elapsed < Duration::from_secs(3600) {
-        format!("{} мин назад", elapsed.as_secs() / 60)
+/// When Steam last saw the owner playing with someone: the time today, or the date before that.
+fn clock(unix: i64) -> String {
+    let Some(time) = Local.timestamp_opt(unix, 0).single() else {
+        return String::new();
+    };
+    if time.date_naive() == Local::now().date_naive() {
+        time.format("%H:%M").to_string()
     } else {
-        Local
-            .timestamp_opt(
-                time.duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64,
-                0,
-            )
-            .single()
-            .map(|dt| dt.format("%d.%m %H:%M").to_string())
-            .unwrap_or_default()
+        time.format("%d.%m").to_string()
     }
 }
 
@@ -723,6 +1023,7 @@ fn humanize_error(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
 
     fn app(status: Status, roster: Option<Roster>) -> CompanionApp {
         let context = egui::Context::default();
@@ -741,6 +1042,15 @@ mod tests {
             error: None,
             updates: None,
             update: None,
+            profiles: None,
+            cards: HashMap::new(),
+            window: None,
+            tray: None,
+            settings: Settings::default(),
+            autostart: false,
+            show_settings: false,
+            settings_error: None,
+            start_hidden: false,
         }
     }
 

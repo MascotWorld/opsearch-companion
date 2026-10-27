@@ -3,6 +3,7 @@
     windows_subsystem = "windows"
 )]
 
+mod tray;
 mod ui;
 
 fn main() -> eframe::Result {

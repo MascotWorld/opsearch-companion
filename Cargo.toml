@@ -15,14 +15,21 @@ path = "src/main.rs"
 [dependencies]
 chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std"] }
 eframe = { version = "=0.37.0", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png"] }
+raw-window-handle = "=0.6.2"
 reqwest = { version = "=0.13.5", default-features = false, features = ["blocking", "json", "rustls"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 sha2 = "=0.11.1"
 thiserror = "=2.0.21"
+webbrowser = "=1.2.5"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "=0.56.0"
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+tray-icon = { version = "=0.26.1", default-features = false }
 
 [dev-dependencies]
 tempfile = "=3.27.0"
