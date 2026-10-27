@@ -1,0 +1,6 @@
+/dist/
+/artifacts/
+*.exe
+config.json
+snapshots.jsonl
+*.tmp

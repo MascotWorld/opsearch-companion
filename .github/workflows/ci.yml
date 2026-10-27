@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-cross-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run tests
+        run: go test ./...
+      - name: Cross-build release architectures
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $env:GOOS = "windows"
+          foreach ($arch in @("amd64", "arm64")) {
+            $env:GOARCH = $arch
+            go build -buildvcs=false -trimpath -o "dist/opsearch-companion-windows-$arch.exe" ./cmd/opsearch-companion
+          }
