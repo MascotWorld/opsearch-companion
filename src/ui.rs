@@ -46,6 +46,12 @@ pub struct CompanionApp {
 impl CompanionApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         apply_theme(&cc.egui_ctx);
+        let app_icon = window_icon();
+        let logo = cc.egui_ctx.load_texture(
+            "opsearch-icon-v1",
+            egui::ColorImage::from(app_icon.as_ref()),
+            egui::TextureOptions::LINEAR,
+        );
         let (core, startup_error) = match CoreHandle::new() {
             Ok(core) => {
                 let _ = core.send(Command::Start);
@@ -54,6 +60,7 @@ impl CompanionApp {
             Err(error) => (None, Some(humanize_error(&error.to_string()))),
         };
         Self {
+            logo,
             core,
             status: Status::Idle,
             owner_id: None,
@@ -197,7 +204,7 @@ impl CompanionApp {
 
     fn render_header(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            brand_mark(ui);
+            brand_mark(ui, &self.logo);
             ui.add_space(11.0);
             ui.vertical(|ui| {
                 ui.label(
@@ -767,17 +774,18 @@ fn card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> 
         .inner
 }
 
-fn brand_mark(ui: &mut egui::Ui) {
-    let (response, painter) = ui.allocate_painter(Vec2::new(40.0, 40.0), Sense::hover());
-    let rect = response.rect;
-    painter.circle_filled(rect.center(), 18.0, PRIMARY);
-    painter.text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        "OP",
-        FontId::new(11.0, FontFamily::Name(Arc::from("unbounded"))),
-        ON_PRIMARY,
-    );
+fn brand_mark(ui: &mut egui::Ui, logo: &egui::TextureHandle) {
+    ui.add(egui::Image::new((logo.id(), Vec2::splat(40.0))));
+}
+
+pub fn window_icon() -> std::sync::Arc<egui::IconData> {
+    std::sync::Arc::new(
+        eframe::icon_data::from_png_bytes(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/opsearch-icon-v1.png"
+        )))
+        .expect("valid OPSearch v1 icon PNG"),
+    )
 }
 
 fn status_pill(ui: &mut egui::Ui, color: Color32, glyph: &str, label: &str) {
@@ -935,7 +943,14 @@ mod tests {
     #[test]
     fn synthetic_paired_screen_renders_without_network_or_steam() {
         let fake_owner = "synthetic-owner-id".to_owned();
+        let context = egui::Context::default();
+        let logo = context.load_texture(
+            "opsearch-icon-v1-test",
+            egui::ColorImage::from(window_icon().as_ref()),
+            egui::TextureOptions::LINEAR,
+        );
         let mut app = CompanionApp {
+            logo,
             core: None,
             status: Status::Watching {
                 steam_id64: fake_owner.clone(),
@@ -961,7 +976,6 @@ mod tests {
             updates: None,
             update: None,
         };
-        let context = egui::Context::default();
         apply_theme(&context);
         let mut rendered = context.run_ui(egui::RawInput::default(), |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
