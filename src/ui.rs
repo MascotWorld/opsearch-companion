@@ -28,6 +28,7 @@ const AMBER: Color32 = Color32::from_rgb(243, 201, 139);
 const RED: Color32 = Color32::from_rgb(241, 166, 166);
 
 pub struct CompanionApp {
+    logo: egui::TextureHandle,
     core: Option<CoreHandle>,
     status: Status,
     owner_id: Option<String>,
