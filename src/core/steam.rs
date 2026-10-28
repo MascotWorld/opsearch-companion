@@ -206,16 +206,31 @@ pub(crate) fn parse_roster(bytes: &[u8], owner: &str, now: SystemTime) -> CoreRe
         }
         rows.push(Row { id, app, playtime });
     }
-    if owner_playtime == 0 {
-        return Err(CoreError::InvalidInput(
-            "owner's CS2 entry is missing from Coplay VDF".into(),
-        ));
-    }
-
     let current_unix = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
     if owner_playtime > current_unix.saturating_add(60) {
         return Err(CoreError::InvalidInput(
             "owner CS2 timestamp is more than one minute in the future".into(),
+        ));
+    }
+
+    // The lobby is anchored on the newest CS2 entry, not only on the owner's own. Steam writes
+    // the people you are playing with while the match is on, but moves the owner's entry
+    // forward only once it ends; anchoring on the owner alone kept showing the previous lobby
+    // for the whole match.
+    let newest_peer = rows
+        .iter()
+        .filter(|row| {
+            row.app == u64::from(CS2_APP_ID)
+                && row.id != owner
+                && row.playtime <= current_unix.saturating_add(60)
+        })
+        .map(|row| row.playtime)
+        .max()
+        .unwrap_or(0);
+    let owner_playtime = owner_playtime.max(newest_peer);
+    if owner_playtime == 0 {
+        return Err(CoreError::InvalidInput(
+            "no CS2 entries in Coplay VDF".into(),
         ));
     }
 
@@ -322,6 +337,31 @@ mod tests {
         assert_eq!(roster.players.len(), 1);
         assert_eq!(roster.players[0].playtime, i64::from(owner_at - 27));
         assert_eq!(roster.players[0].app_id, 730);
+    }
+
+    #[test]
+    fn follows_the_match_in_progress_before_steam_moves_the_owner_entry() {
+        // Mid-match: the new lobby is already in the file, the owner's entry still has the
+        // previous match's time.
+        let previous_match = 1_793_090_000i32;
+        let now_at = 1_793_094_741i32;
+        let mut b = fixture(
+            76_561_198_000_000_000,
+            76_561_198_000_000_001,
+            76_561_198_000_000_002,
+            previous_match,
+        );
+        // Replace the old row's timestamp with one from the match being played.
+        let old = 76_561_198_000_000_002u64.to_le_bytes();
+        let at = b.windows(8).rposition(|w| w == old).unwrap() + 8 + 1 + "gameid".len() + 1 + 8;
+        let at = at + 1 + "Playtime".len() + 1;
+        b[at..at + 4].copy_from_slice(&(now_at - 30).to_le_bytes());
+
+        let now = UNIX_EPOCH + Duration::from_secs(now_at as u64);
+        let roster = parse_roster(&b, "76561198000000000", now).unwrap();
+        assert_eq!(roster.owner_playtime, i64::from(now_at - 30));
+        assert_eq!(roster.players.len(), 1);
+        assert_eq!(roster.players[0].steamid64, "76561198000000002");
     }
 
     #[test]
